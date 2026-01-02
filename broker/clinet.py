@@ -19,8 +19,8 @@ print("📤 Sent English Mock Data")
 
 time.sleep(1)
 
-test_payload_fa = "+989121234567:0633064406270645"
-client.publish("device/MC60/sms_rx", test_payload_fa)
-print("📤 Sent Persian (Hex) Mock Data")
+# test_payload_fa = "+989121234567:0633064406270645"
+# client.publish("device/MC60/sms_rx", test_payload_fa)
+# print("📤 Sent Persian (Hex) Mock Data")
 
 client.disconnect()

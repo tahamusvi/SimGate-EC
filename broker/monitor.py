@@ -8,7 +8,7 @@ public_ip = os.getenv("IP", "localhost")
 
 def on_connect(client, userdata, flags, rc):
     print(f"✅ Monitor connected with result code {rc}")
-    client.subscribe("device/MC60/sms_rx")
+    client.subscribe("device/MC60/commands")
 
 def on_message(client, userdata, msg):
     print(f"🔔 New SMS Data Received!")
