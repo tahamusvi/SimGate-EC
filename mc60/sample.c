@@ -10,31 +10,6 @@
 #include "ril.h"
 #include "ril_network.h"
 
-/* ================== MQTT URC bridge from ril_urc.c ==================
-   ril_urc.c باید این URC رو بفرسته:
-   Ql_OS_SendMessage(URC_RCV_TASK_ID, MSG_ID_URC_INDICATION, URC_MQTT_RECV_IND, 0);
-
-   و این getterها رو داشته باشه:
-   const char* RIL_MQTT_GetTopic(void);
-   const char* RIL_MQTT_GetPayload(void);
-*/
-#define URC_MQTT_RECV_IND   2001
-extern const char* RIL_MQTT_GetTopic(void);
-extern const char* RIL_MQTT_GetPayload(void);
-
-/* ================== USSD URC bridge from ril_urc.c ==================
-   ril_urc.c باید +CUSD رو بگیره و این رو بفرسته:
-   Ql_OS_SendMessage(URC_RCV_TASK_ID, MSG_ID_URC_INDICATION, URC_USSD_RECV_IND, 0);
-
-   و این getterها رو داشته باشه:
-   const char* RIL_USSD_GetStr(void);
-   int         RIL_USSD_GetDcs(void);
-*/
-#define URC_USSD_RECV_IND   2002
-extern const char* RIL_USSD_GetStr(void);
-extern int         RIL_USSD_GetDcs(void);
-static void ucs2_hex_sanitize_and_trim(const char *in, char *out, u32 outsz);
-
 /* ================== CONFIG ================== */
 #define DBG_UART_PORT   UART_PORT1
 #define DBG_BAUD        115200
@@ -48,8 +23,7 @@ static char g_pass[] = "";
 
 #define MQTT_HOST       "78.39.182.223"
 #define MQTT_PORT       1883
-
-#define CLIENT_ID       "mc60_client_A_01"
+#define CLIENT_ID       "mc60_client_A"
 
 #define TOPIC_SMS_RX    "device/MC60/sms_rx" /* module -> server */
 #define TOPIC_SMS_TX    "device/MC60/sms_tx" /* server -> module */
@@ -60,17 +34,13 @@ static char g_pass[] = "";
 #define MQTT_QOS        1
 #define MQTT_RETAIN     0
 
-/* ---------- USSD config ---------- */
-#define USSD_BALANCE_CODE   "*10*121#"        /* کد شارژ/مانده اپراتور (به دلخواه تغییر بده) */
-#define BALANCE_SMS_TO      "+989303016386"  /* شماره مقصد برای SMS نتیجه */
-#define USSD_TIMEOUT_SEC    25
-
 /* ================== TIMER ================== */
 #define TMR_ID  1
 #define TMR_MS  100
 
-
-static s32 Send_Persian_SMS_Fixed(char* phoneNumber, char* ussdHexMessage);
+/* ================== MQTT RX URC (باید مقدار واقعی را جایگزین کنی) ================== */
+/* وقتی سرور publish می‌کند و URC جدید می‌بینی، p1 را اینجا بگذار */
+#define URC_MQTT_RX_P1   0xFFFF
 
 /* ================== DEBUG ================== */
 static void DBG_Write(const char *s)
@@ -90,7 +60,7 @@ static void DBG_AT(const char *tag, char *line, u32 len)
     DBG_Write("\r\n");
 }
 
-/* ================== UART echo (optional) ================== */
+/* ================== UART echo (اختیاری) ================== */
 static void UartCb(Enum_SerialPort port, Enum_UARTEventType event, bool pinLevel, void *customizePara)
 {
     (void)pinLevel; (void)customizePara;
@@ -217,12 +187,6 @@ static volatile u8 g_at_busy = 0;
 typedef enum {
     ST_IDLE = 0,
     ST_WAIT_REG,
-
-    /* USSD (added) */
-    ST_USSD_REQ,
-    ST_USSD_WAIT,
-    ST_USSD_SMS,
-
     ST_PDP,
     ST_MQTT_CFG,
     ST_MQTT_OPEN,
@@ -242,14 +206,6 @@ static u8  g_mqtt_subscribed = 0;
 
 static u16 g_mqtt_msgid = 1;
 static u8  g_hb_due = 0;
-
-/* ---------- USSD runtime (added) ---------- */
-static volatile u8  g_ussd_got = 0;
-static volatile u8  g_ussd_sms_started = 0;
-static u32          g_ussd_wait_start_sec = 0;
-static u8 g_ussd_is_hex = 0;
-static char g_ussd_text[600];   /* قبلاً 280 بود، برای hex بهتره بزرگ‌تر باشه */
-
 
 /* ================== Queues ================== */
 #define SMS_IDX_Q_MAX  8
@@ -468,7 +424,15 @@ static void MQTT_CFG_Once(void)
     Ql_RIL_SendATCmd("AT+QMTCFG=\"SHOWRECVLEN\",0,1\r\n", Ql_strlen("AT+QMTCFG=\"SHOWRECVLEN\",0,1\r\n"), NULL, NULL, 0);
 }
 
-/* ================== MQTT payload -> SMS enqueue ================== */
+/* ================== QMTRECV READ ================== */
+typedef struct {
+    char topic[128];
+    char payload[256];
+    u8 got;
+} QMTRECV_CTX;
+
+static QMTRECV_CTX g_qmtr;
+
 static void Handle_ServerCmd_ToSMS(const char *payload)
 {
     /* payload format: phone:msg */
@@ -488,12 +452,64 @@ static void Handle_ServerCmd_ToSMS(const char *payload)
 
     if (phone[0] == 0 || msg[0] == 0) return;
 
+    /* اگر UCS2 hex بود: طول %4==0 و همه hex */
     if (looks_like_ucs2_hex(msg))
         sms_tx_push(phone, msg, 1);
     else
         sms_tx_push(phone, msg, 0);
 
     DBG_Line("[MQTT] sms_tx enqueued");
+}
+
+static s32 AT_QMTRECV_Handler(char* line, u32 len, void* userdata)
+{
+    QMTRECV_CTX *ctx = (QMTRECV_CTX*)userdata;
+    DBG_AT("[QMTRECV]", line, len);
+
+    if (mem_contains(line, len, "+QMTRECV:"))
+    {
+        /* +QMTRECV: 0,1,"topic","payload"
+           یا با SHOWRECVLEN ممکنه یک عدد length هم وسط باشد، ما ساده‌ترین حالت را parse می‌کنیم */
+        char tmp[420];
+        char *q1, *q2, *q3, *q4;
+
+        copy_line_trim(tmp, sizeof(tmp), line, len);
+
+        q1 = Ql_strchr(tmp, '"'); if (!q1) return RIL_ATRSP_CONTINUE;
+        q2 = Ql_strchr(q1 + 1, '"'); if (!q2) return RIL_ATRSP_CONTINUE;
+
+        q3 = Ql_strchr(q2 + 1, '"'); if (!q3) return RIL_ATRSP_CONTINUE;
+        q4 = Ql_strchr(q3 + 1, '"'); if (!q4) return RIL_ATRSP_CONTINUE;
+
+        Ql_memset(ctx->topic, 0, sizeof(ctx->topic));
+        Ql_memset(ctx->payload, 0, sizeof(ctx->payload));
+
+        Ql_strncpy(ctx->topic, q1 + 1, (u32)(q2 - (q1 + 1)));
+        Ql_strncpy(ctx->payload, q3 + 1, (u32)(q4 - (q3 + 1)));
+        ctx->got = 1;
+
+        return RIL_ATRSP_CONTINUE;
+    }
+
+    if (mem_contains(line, len, "OK")) { g_at_busy = 0; return RIL_ATRSP_SUCCESS; }
+    if (mem_contains(line, len, "ERROR") || mem_contains(line, len, "+CME ERROR") || mem_contains(line, len, "+CMS ERROR"))
+    { g_at_busy = 0; return RIL_ATRSP_FAILED; }
+
+    return RIL_ATRSP_CONTINUE;
+}
+
+static s32 MQTT_ReadOneMsg(u16 msgid)
+{
+    char at[80];
+    if (g_at_busy) return RIL_AT_BUSY;
+
+    Ql_memset(&g_qmtr, 0, sizeof(g_qmtr));
+    Ql_memset(at, 0, sizeof(at));
+    Ql_sprintf(at, "AT+QMTRECV=0,%d\r\n", (int)msgid);
+
+    DBG_Line("==> SEND QMTRECV(read)");
+    g_at_busy = 1;
+    return Ql_RIL_SendATCmd(at, Ql_strlen(at), AT_QMTRECV_Handler, &g_qmtr, 0);
 }
 
 /* ================== SMS: CMGR/CMGD/CMGS ================== */
@@ -536,7 +552,6 @@ static int parse_second_quoted(const char *s, char *out, u32 outsz)
     }
     return -1;
 }
-
 
 static s32 AT_CMGR_Handler(char* line, u32 len, void* userdata)
 {
@@ -684,173 +699,6 @@ static s32 SMS_Send_UCS2(const char *phone_ascii, const char *msg_ascii_or_hex, 
     return Ql_RIL_SendATCmd(at, Ql_strlen(at), AT_CMGS_Handler, &g_cmgs, 0);
 }
 
-/* ================== USSD: CUSD send + result decode (added) ================== */
-
-static s32 AT_CUSD_Handler(char* line, u32 len, void* userdata)
-{
-    (void)userdata;
-    DBG_AT("[CUSD]", line, len);
-
-    /* توجه: متن اصلی در URC +CUSD می‌آید، این handler فقط OK/ERROR را جمع می‌کند */
-    if (mem_contains(line, len, "OK")) { g_at_busy = 0; return RIL_ATRSP_SUCCESS; }
-    if (mem_contains(line, len, "ERROR") || mem_contains(line, len, "+CME ERROR") || mem_contains(line, len, "+CMS ERROR"))
-    { g_at_busy = 0; return RIL_ATRSP_FAILED; }
-
-    return RIL_ATRSP_CONTINUE;
-}
-
-static s32 USSD_Send(const char *code_ascii)
-{
-    char at[200];
-    char code_ucs2[120]; /* برای *140# کاملاً کافیه */
-
-    if (g_at_busy) return RIL_AT_BUSY;
-    if (!code_ascii) return RIL_AT_INVALID_PARAM;
-
-    Ql_memset(code_ucs2, 0, sizeof(code_ucs2));
-    ascii_to_ucs2_hex(code_ascii, code_ucs2, sizeof(code_ucs2));
-
-    /* مطمئن شو CSCS روی UCS2 هست (چون ممکنه جای دیگه تغییر کرده باشه) */
-    Ql_RIL_SendATCmd("AT+CSCS=\"UCS2\"\r\n", Ql_strlen("AT+CSCS=\"UCS2\"\r\n"), NULL, NULL, 0);
-
-    /* مهم: خیلی وقت‌ها پارامتر سوم (dcs) لازم نیست. اول بدونش تست کن. */
-    Ql_memset(at, 0, sizeof(at));
-    Ql_sprintf(at, "AT+CUSD=1,\"%s\"\r\n", code_ucs2);
-
-    DBG_Line("==> SEND CUSD (USSD UCS2)");
-    g_at_busy = 1;
-    return Ql_RIL_SendATCmd(at, Ql_strlen(at), AT_CUSD_Handler, NULL, 0);
-}
-
-
-#define MAX_UCS2_LENGTH 140  // حداکثر تعداد هگز برای UCS2 (70 کاراکتر UCS2)
-#define MAX_SMS_LENGTH    160  // حداکثر طول SMS (160 کاراکتر ASCII) که 140 هگز UCS2 رو جا می‌ده
-
-static s32 SMS_Send_UCS2_Limited(const char *phone, const char *msg, u8 is_hex)
-{
-    char at[160]; // برای پیام کوتاه حداکثر 160 کاراکتر
-    u32 len = Ql_strlen(msg);
-
-    if (len > MAX_UCS2_LENGTH)
-    {
-        // اگر طول پیام زیاد است، آن را تقسیم کن به چند بخش و ارسال کن
-        u32 start = 0;
-        while (start < len)
-        {
-            u32 chunk_size = (len - start > MAX_UCS2_LENGTH) ? MAX_UCS2_LENGTH : (len - start);
-            Ql_memset(at, 0, sizeof(at));
-
-            // ارسال بخش کوچکتر پیام
-            Ql_sprintf(at, "AT+CMGS=\"%s\"\r\n", phone);
-            Ql_RIL_SendATCmd(at, Ql_strlen(at), NULL, NULL, 0);
-
-            // ارسال پیامی با اندازه کوچک‌تر
-            Ql_sprintf(at, "%s", msg + start);
-            Ql_RIL_WriteDataToCore((u8*)at, Ql_strlen(at));
-
-            start += chunk_size;
-        }
-        return RIL_ATRSP_CONTINUE; // چند بخش ارسال شد
-    }
-    else
-    {
-        // ارسال پیام در حالت عادی
-        Ql_memset(at, 0, sizeof(at));
-        Ql_sprintf(at, "AT+CMGS=\"%s\"\r\n", phone);
-        Ql_RIL_SendATCmd(at, Ql_strlen(at), NULL, NULL, 0);
-        Ql_RIL_WriteDataToCore((u8*)msg, len); // ارسال پیام
-        return RIL_ATRSP_CONTINUE;
-    }
-}
-
-
-
-static void USSD_OnResultAndPrepareSMS(const char *ussd_str, int dcs)
-{
-    char dec[280];
-    int non_ascii = 0;
-    (void)dcs;
-
-    Ql_memset(dec, 0, sizeof(dec));
-    Ql_memset(g_ussd_text, 0, sizeof(g_ussd_text));
-    g_ussd_is_hex = 0;
-
-    if (!ussd_str || ussd_str[0] == '\0')
-    {
-        Ql_strcpy(g_ussd_text, "USSD: (empty)");
-        return;
-    }
-
-    /* اول تلاش کن ببینی واقعاً UCS2 hex هست یا نه (حتی اگر ناقص بود sanitize می‌کنیم) */
-    if (looks_like_ucs2_hex(ussd_str))
-    {
-        /* اگر انگلیسی بود decode کن */
-        ucs2_hex_to_ascii(ussd_str, dec, sizeof(dec), &non_ascii);
-        if (!non_ascii && dec[0] != '\0')
-        {
-            Ql_strncpy(g_ussd_text, dec, sizeof(g_ussd_text)-1);
-            g_ussd_is_hex = 0;
-        }
-        else
-        {
-            ucs2_hex_sanitize_and_trim(ussd_str, g_ussd_text, sizeof(g_ussd_text));
-            g_ussd_is_hex = 1;
-        }
-    }
-    else
-    {
-        /* اگر looks_like_ucs2_hex رد کرد (مثلا به خاطر truncate)، باز هم sanitize کن و اگر حداقل 4تا hex داشت hex حسابش کن */
-        char tmp[700];
-        Ql_memset(tmp, 0, sizeof(tmp));
-        ucs2_hex_sanitize_and_trim(ussd_str, tmp, sizeof(tmp));
-
-        if (Ql_strlen(tmp) >= 4)
-        {
-            Ql_strncpy(g_ussd_text, tmp, sizeof(g_ussd_text)-1);
-            g_ussd_is_hex = 1;
-        }
-        else
-        {
-            Ql_strncpy(g_ussd_text, ussd_str, sizeof(g_ussd_text)-1);
-            g_ussd_is_hex = 0;
-        }
-    }
-}
-
-
-#define SMS_UCS2_HEX_MAX_DIGITS   280  /* 70 UCS2 chars * 4 hex digits */
-
-static void ucs2_hex_sanitize_and_trim(const char *in, char *out, u32 outsz)
-{
-    u32 i=0, o=0;
-    if (!out || outsz==0) return;
-    out[0]='\0';
-    if (!in) return;
-
-    /* فقط hexها */
-    while (in[i] && (o + 1) < outsz)
-    {
-        char c = in[i++];
-        if (is_hex_char(c))
-            out[o++] = c;
-    }
-    out[o] = '\0';
-
-    /* طول باید مضرب 4 باشه */
-    o = (u32)Ql_strlen(out);
-    o = (o / 4) * 4;
-    out[o] = '\0';
-
-    /* محدودیت طول برای SMS UCS2 */
-    if (o > SMS_UCS2_HEX_MAX_DIGITS)
-    {
-        out[SMS_UCS2_HEX_MAX_DIGITS] = '\0';
-        /* دوباره مضرب 4 */
-        out[(SMS_UCS2_HEX_MAX_DIGITS/4)*4] = '\0';
-    }
-}
-
-
 /* ================== Build SMS->MQTT payload ================== */
 static void sms_prepare_payload_and_enqueue(const char *sender_raw, const char *msg_raw)
 {
@@ -962,19 +810,14 @@ static void StateMachine_1s(void)
         DBG_Write("\r\n====================\r\nSTATE -> ");
         switch (g_state)
         {
-        case ST_WAIT_REG:   DBG_Line("WAIT_REG"); break;
-
-        case ST_USSD_REQ:   DBG_Line("USSD_REQ"); break;
-        case ST_USSD_WAIT:  DBG_Line("USSD_WAIT"); break;
-        case ST_USSD_SMS:   DBG_Line("USSD_SMS"); break;
-
-        case ST_PDP:        DBG_Line("PDP"); break;
-        case ST_MQTT_CFG:   DBG_Line("MQTT_CFG"); break;
-        case ST_MQTT_OPEN:  DBG_Line("MQTT_OPEN"); break;
-        case ST_MQTT_CONN:  DBG_Line("MQTT_CONN"); break;
-        case ST_MQTT_SUB:   DBG_Line("MQTT_SUB"); break;
-        case ST_READY:      DBG_Line("READY"); break;
-        default:            DBG_Line("IDLE"); break;
+        case ST_WAIT_REG:  DBG_Line("WAIT_REG"); break;
+        case ST_PDP:       DBG_Line("PDP"); break;
+        case ST_MQTT_CFG:  DBG_Line("MQTT_CFG"); break;
+        case ST_MQTT_OPEN: DBG_Line("MQTT_OPEN"); break;
+        case ST_MQTT_CONN: DBG_Line("MQTT_CONN"); break;
+        case ST_MQTT_SUB:  DBG_Line("MQTT_SUB"); break;
+        case ST_READY:     DBG_Line("READY"); break;
+        default:           DBG_Line("IDLE"); break;
         }
     }
 
@@ -985,65 +828,9 @@ static void StateMachine_1s(void)
         if (reg == NW_STAT_REGISTERED || reg == NW_STAT_REGISTERED_ROAMING)
         {
             DBG_Line("[NET] REGISTERED OK");
-            g_state = ST_USSD_REQ; /* added: USSD قبل از PDP */
+            g_state = ST_PDP;
         }
         else DBG_Line("[NET] not registered yet...");
-        break;
-
-    /* ---------- USSD flow (added) ---------- */
-    case ST_USSD_REQ:
-        if (!g_at_busy)
-        {
-            g_ussd_got = 0;
-            g_ussd_sms_started = 0;
-            g_ussd_wait_start_sec = g_sec;
-            Ql_memset(g_ussd_text, 0, sizeof(g_ussd_text));
-
-            (void)USSD_Send(USSD_BALANCE_CODE);
-            g_state = ST_USSD_WAIT;
-        }
-        break;
-
-    case ST_USSD_WAIT:
-        if (g_ussd_got)
-        {
-            DBG_Line("[USSD] got result -> send SMS");
-            g_state = ST_USSD_SMS;
-        }
-        else
-        {
-            if ((g_sec - g_ussd_wait_start_sec) > USSD_TIMEOUT_SEC)
-            {
-                DBG_Line("[USSD] timeout -> continue PDP");
-                g_state = ST_PDP;
-            }
-        }
-        break;
-
-    case ST_USSD_SMS:
-        if (!g_ussd_sms_started)
-        {
-            DBG_Line("[USSD] sending balance via SMS...");
-
-            s32 r = Send_Persian_SMS_Fixed(BALANCE_SMS_TO , g_ussd_text);
-
-            if (r == RIL_AT_SUCCESS)
-            {
-                g_ussd_sms_started = 1;
-                /* اگر نمی‌خوای منتظر تایید بمونی، همینجا برو state بعدی */
-                g_state = ST_PDP;  /* یا هر state بعدی خودت */
-            }
-            else if (r == RIL_AT_BUSY)
-            {
-                /* صبر کن، دفعه بعد دوباره تلاش می‌کنه */
-            }
-            else
-            {
-                /* خطای واقعی: لاگ کن و تصمیم بگیر retry یا fail */
-                g_ussd_sms_started = 1;  /* برای جلوگیری از گیر بی‌نهایت */
-                g_state = ST_PDP;
-            }
-        }
         break;
 
     case ST_PDP:
@@ -1130,7 +917,7 @@ void proc_main_task(s32 taskId)
 
     Ql_UART_Register(DBG_UART_PORT, UartCb, NULL);
     Ql_UART_Open(DBG_UART_PORT, DBG_BAUD, DBG_FLOW);
-    DBG_Line("=== MC60 APP (MQTT +QMTRECV URC -> SMS) + USSD on boot ===");
+    DBG_Line("=== MC60 APP (NO RegisterURC) ===");
 
     Ql_Timer_Register(TMR_ID, TimerCb, NULL);
 
@@ -1152,35 +939,6 @@ void proc_main_task(s32 taskId)
                 Ql_sprintf(b, "[URC] p1=%lu p2=%lu\r\n",
                            (unsigned long)msg.param1, (unsigned long)msg.param2);
                 DBG_Write(b);
-            }
-
-            /* ---------- MQTT receive (bridge) ---------- */
-            if (msg.param1 == URC_MQTT_RECV_IND)
-            {
-                const char *t = RIL_MQTT_GetTopic();
-                const char *p = RIL_MQTT_GetPayload();
-
-                DBG_Line("[MQTT] +QMTRECV URC arrived");
-                if (t) { DBG_Write("[MQTT] topic="); DBG_Line(t); }
-                if (p) { DBG_Write("[MQTT] payload="); DBG_Line(p); }
-
-                if (t && p && (0 == Ql_strcmp(t, TOPIC_SMS_TX)))
-                {
-                    Handle_ServerCmd_ToSMS(p); // payload: phone:msg
-                }
-            }
-
-            /* ---------- USSD receive (bridge) ---------- */
-            if (msg.param1 == URC_USSD_RECV_IND)
-            {
-                const char *s = RIL_USSD_GetStr();
-                int dcs = RIL_USSD_GetDcs();
-
-                DBG_Line("[USSD] +CUSD URC arrived");
-                if (s) { DBG_Write("[USSD] raw="); DBG_Line(s); }
-
-                USSD_OnResultAndPrepareSMS(s, dcs);
-                g_ussd_got = 1;
             }
 
             /* SIM ready */
@@ -1207,21 +965,6 @@ void proc_main_task(s32 taskId)
                 g_mqtt_connected = 0;
                 g_mqtt_subscribed = 0;
 
-                /* clear queues */
-                g_sms_idx_w = g_sms_idx_r = 0;
-                g_pub_w = g_pub_r = 0;
-                g_sms_tx_w = g_sms_tx_r = 0;
-
-                /* clear cmgr/delete state */
-                g_sms_delete_idx = 0;
-                Ql_memset(&g_cmgr, 0, sizeof(g_cmgr));
-
-                /* clear ussd state */
-                g_ussd_got = 0;
-                g_ussd_sms_started = 0;
-                g_ussd_wait_start_sec = 0;
-                Ql_memset(g_ussd_text, 0, sizeof(g_ussd_text));
-
                 Ql_Timer_Start(TMR_ID, TMR_MS, TRUE);
             }
 
@@ -1230,6 +973,19 @@ void proc_main_task(s32 taskId)
             {
                 DBG_Line("[SMS] NEW SMS IND");
                 sms_idx_push((u16)msg.param2);
+            }
+
+            /* mqtt rx urc -> read message */
+            if (msg.param1 == URC_MQTT_RX_P1)
+            {
+                DBG_Line("[MQTT] RX URC -> read QMTRECV");
+                (void)MQTT_ReadOneMsg((u16)msg.param2);
+
+                if (!g_at_busy && g_qmtr.got)
+                {
+                    if (0 == Ql_strcmp(g_qmtr.topic, TOPIC_SMS_TX))
+                        Handle_ServerCmd_ToSMS(g_qmtr.payload);
+                }
             }
         }
 

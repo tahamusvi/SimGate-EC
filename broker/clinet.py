@@ -9,12 +9,14 @@ public_ip = os.getenv("IP", "localhost")
 
 
 client = mqtt.Client()
-client.connect(public_ip, 1883, 60)
+# client.connect(public_ip, 1883, 60)
 
+client.connect("78.39.182.223", 1883, 60)
 
 
 test_payload_en = "+989121234567:Hello from MC60!"
-client.publish("device/MC60/sms_rx", test_payload_en)
+
+client.publish("device/MC60/sms_tx", "+989303016386:Hello!")
 print("📤 Sent English Mock Data")
 
 time.sleep(1)
